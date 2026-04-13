@@ -184,7 +184,6 @@ def _compute_confidence(image, xc, yc, sx, sy, A):
     - Goodness of fit (R-squared)
     - Peak SNR of the fitted spot vs background
     - Compactness (sigma reasonableness and aspect ratio)
-    - Center location within the patch
     """
     h, w = image.shape
     x_grid, y_grid = _build_coordinates(h, w)
@@ -222,17 +221,8 @@ def _compute_confidence(image, xc, yc, sx, sy, A):
     elif aspect > 3:
         sigma_score *= 0.6
 
-    center_score = 1.0
-    if xc < 0 or xc >= w or yc < 0 or yc >= h:
-        center_score = 0.1
-    else:
-        # Slightly penalize detections far from patch center
-        dist_from_center = np.sqrt((xc - w / 2) ** 2 + (yc - h / 2) ** 2)
-        max_dist = np.sqrt((w / 2) ** 2 + (h / 2) ** 2)
-        center_score = max(0.3, 1.0 - 0.5 * dist_from_center / max_dist)
-
-    confidence = (0.35 * r_squared + 0.30 * snr_score +
-                  0.20 * sigma_score + 0.15 * center_score)
+    confidence = (0.45 * r_squared + 0.35 * snr_score +
+                  0.20 * sigma_score)
     return float(np.clip(confidence, 0, 1))
 
 

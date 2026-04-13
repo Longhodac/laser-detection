@@ -12,8 +12,16 @@ from typing import List, Optional
 
 from preprocess import preprocess, load_image
 from color_scoring import compute_laser_score
-from detectors import run_detectors
+from detectors import Candidate, run_detectors
 from fgf_full import fgf_full
+
+
+DEFAULT_DETECTOR_THRESHOLDS = {
+    "log_threshold": 0.15,
+    "dog_threshold": 0.15,
+    "tophat_threshold_factor": 4.0,
+    "radial_threshold_factor": 4.0,
+}
 
 
 @dataclass
@@ -27,6 +35,10 @@ class LaserDetection:
     confidence: float      # quality score [0, 1]
     patch_x0: int = 0      # patch origin x in full image
     patch_y0: int = 0      # patch origin y in full image
+    fit_source: Optional[str] = None
+    candidate_response: float = 0.0
+    detector_support: int = 0
+    candidate_drift: float = 0.0
 
 
 @dataclass
@@ -51,9 +63,131 @@ def extract_patch(score_map, cx, cy, pad=30):
     return patch, x0, y0
 
 
+def _compute_response_conf(score_map, cx, cy, inner_radius=2, outer_radius=6):
+    """Compute how strongly the candidate stands out in the score map."""
+    h, w = score_map.shape
+    cx_i = int(round(cx))
+    cy_i = int(round(cy))
+    y0 = max(cy_i - outer_radius, 0)
+    y1 = min(cy_i + outer_radius + 1, h)
+    x0 = max(cx_i - outer_radius, 0)
+    x1 = min(cx_i + outer_radius + 1, w)
+    patch = score_map[y0:y1, x0:x1]
+    if patch.size == 0:
+        return 0.0
+
+    peak = float(score_map[cy_i, cx_i])
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    ring = patch[(dist >= inner_radius) & (dist <= outer_radius)]
+    if ring.size == 0:
+        baseline = float(np.median(patch))
+    else:
+        baseline = float(np.percentile(ring, 90))
+
+    local_prominence = max(0.0, peak - baseline)
+    return float(np.clip(local_prominence + 0.1 * peak, 0.0, 1.0))
+
+
+def _size_score(sigma_x, sigma_y):
+    """Soft size sanity for fitted laser blobs."""
+    max_sigma = max(sigma_x, sigma_y)
+    min_sigma = min(sigma_x, sigma_y)
+
+    if max_sigma <= 5.0:
+        score = 1.0
+    elif max_sigma <= 8.0:
+        score = 0.6
+    else:
+        score = 0.2
+
+    if min_sigma < 0.6:
+        score *= 0.5
+
+    return float(score)
+
+
+def _aspect_score(sigma_x, sigma_y):
+    """Soft aspect-ratio sanity for fitted laser blobs."""
+    aspect = max(sigma_x, sigma_y) / (min(sigma_x, sigma_y) + 1e-8)
+    if aspect <= 2.5:
+        return 1.0
+    if aspect <= 4.0:
+        return 0.5
+    return 0.1
+
+
+def _evaluate_fit(source_name, fit_result, expected_x, expected_y, pad):
+    """Score and validate one FGF fit candidate."""
+    xc, yc, sx, sy, amplitude, raw_conf = fit_result
+    values = np.array([xc, yc, sx, sy, amplitude, raw_conf], dtype=np.float64)
+    if not np.all(np.isfinite(values)) or sx <= 0 or sy <= 0 or amplitude <= 0:
+        return None
+
+    drift = float(np.hypot(xc - expected_x, yc - expected_y))
+    max_sigma = max(sx, sy)
+    aspect = max_sigma / (min(sx, sy) + 1e-8)
+    hard_drift_limit = min(10.0, pad / 3.0)
+    hard_reject = (
+        drift > hard_drift_limit or
+        max_sigma > (pad / 2.0) or
+        aspect > 8.0
+    )
+
+    drift_score = float(np.clip(1.0 - drift / 10.0, 0.0, 1.0))
+    size_score = _size_score(sx, sy)
+    aspect_score = _aspect_score(sx, sy)
+    sanity_conf = float(np.clip(
+        0.5 * drift_score + 0.25 * size_score + 0.25 * aspect_score,
+        0.0,
+        1.0,
+    ))
+    fit_conf = float(np.clip(raw_conf * size_score * aspect_score, 0.0, 1.0))
+    selection_score = 0.7 * fit_conf + 0.3 * sanity_conf
+
+    return {
+        "source": source_name,
+        "xc": float(xc),
+        "yc": float(yc),
+        "sigma_x": float(sx),
+        "sigma_y": float(sy),
+        "amplitude": float(amplitude),
+        "raw_conf": float(raw_conf),
+        "fit_conf": fit_conf,
+        "sanity_conf": sanity_conf,
+        "selection_score": float(selection_score),
+        "drift": drift,
+        "drift_score": drift_score,
+        "size_score": size_score,
+        "aspect_score": aspect_score,
+        "hard_reject": hard_reject,
+    }
+
+
+def _select_best_fit(score_fit, gray_fit):
+    """Prefer stable score-map fits when grayscale is only marginally better."""
+    valid_fits = [
+        fit for fit in (score_fit, gray_fit)
+        if fit is not None and not fit["hard_reject"]
+    ]
+    if not valid_fits:
+        return None
+
+    if score_fit is not None and gray_fit is not None:
+        if not score_fit["hard_reject"] and not gray_fit["hard_reject"]:
+            gray_margin = gray_fit["selection_score"] - score_fit["selection_score"]
+            if gray_margin < 0.05 and gray_fit["sanity_conf"] < score_fit["sanity_conf"]:
+                return score_fit
+
+    return max(
+        valid_fits,
+        key=lambda fit: (fit["selection_score"], fit["sanity_conf"], fit["fit_conf"]),
+    )
+
+
 def detect_laser(image_path=None, image_bgr=None, laser_color="auto",
-                 do_preprocess=True, pad=30, min_confidence=0.15,
-                 max_detections=10, debug=False):
+                 do_preprocess=True, pad=30, min_confidence=0.35,
+                 max_detections=10, debug=False, detector_thresholds=None):
     """
     Main pipeline entry point.
 
@@ -81,6 +215,9 @@ def detect_laser(image_path=None, image_bgr=None, laser_color="auto",
         raise ValueError("Provide image_path or image_bgr")
 
     result = PipelineResult()
+    detector_config = dict(DEFAULT_DETECTOR_THRESHOLDS)
+    if detector_thresholds:
+        detector_config.update(detector_thresholds)
 
     # --- Stage 1: Preprocess ---
     if do_preprocess:
@@ -90,38 +227,56 @@ def detect_laser(image_path=None, image_bgr=None, laser_color="auto",
     result.preprocessed = bgr_proc
 
     # --- Stage 2: Color scoring ---
-    score_map, detected_color = compute_laser_score(bgr_proc, color=laser_color)
+    if debug:
+        score_map, detected_color, score_debug = compute_laser_score(
+            bgr_proc,
+            color=laser_color,
+            return_debug=True,
+        )
+        result.debug.update(score_debug)
+    else:
+        score_map, detected_color = compute_laser_score(
+            bgr_proc,
+            color=laser_color,
+        )
     result.laser_color = detected_color
     result.score_map = score_map
 
     # --- Stage 3: Candidate detection ---
     gray = cv2.cvtColor(bgr_proc, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-
-    # Tune detector sensitivity based on score map statistics
-    score_max = score_map.max()
-    adaptive_threshold = max(0.02, score_max * 0.1)
+    pre_fgf_limit = 8 if max_detections <= 10 else min(max(max_detections * 2, 8), 32)
 
     candidates, det_debug = run_detectors(
         score_map, gray,
         use_log=True, use_tophat=True, use_radial=True,
-        merge_radius=max(10, pad // 2),
-        max_candidates=max_detections * 3
+        merge_radius=max(8, pad // 3),
+        max_candidates=pre_fgf_limit,
+        **detector_config,
     )
 
     if debug:
-        result.debug = det_debug
+        result.debug.update(det_debug)
+        result.debug["pre_fgf_limit"] = int(pre_fgf_limit)
+        result.debug["min_confidence"] = float(min_confidence)
 
     # Always include score-map argmax as a candidate
     cy_peak, cx_peak = np.unravel_index(np.argmax(score_map), score_map.shape)
     peak_val = score_map[cy_peak, cx_peak]
-    argmax_cand = (float(cy_peak), float(cx_peak), 2.0, float(peak_val))
+    argmax_cand = Candidate(
+        y=float(cy_peak),
+        x=float(cx_peak),
+        sigma=2.0,
+        response=float(peak_val),
+        detector_sources=("argmax",),
+        detector_support=1,
+    )
 
     if not candidates:
         candidates = [argmax_cand]
     else:
         # Add argmax if not already near an existing candidate
         already_near = any(
-            np.sqrt((c[0] - argmax_cand[0])**2 + (c[1] - argmax_cand[1])**2) < 15
+            np.sqrt((c.y - argmax_cand.y) ** 2 + (c.x - argmax_cand.x) ** 2) < 15
             for c in candidates
         )
         if not already_near:
@@ -130,44 +285,68 @@ def detect_laser(image_path=None, image_bgr=None, laser_color="auto",
     # --- Stage 4: FGF refinement on each candidate ---
     # Run FGF on both score_map and raw grayscale, keep the better fit
     detections = []
-    for (cy, cx, sigma_est, response) in candidates:
+    for candidate in candidates:
+        cy, cx, sigma_est, response = candidate
         patch_score, x0, y0 = extract_patch(score_map, cx, cy, pad=pad)
         patch_gray, _, _ = extract_patch(gray, cx, cy, pad=pad)
         if patch_score.shape[0] < 5 or patch_score.shape[1] < 5:
             continue
 
-        try:
-            xc_s, yc_s, sx_s, sy_s, A_s, conf_s = fgf_full(
-                patch_score.astype(np.float64))
-        except Exception:
-            conf_s = 0
+        expected_x = float(cx - x0)
+        expected_y = float(cy - y0)
+        score_fit = None
+        gray_fit = None
 
         try:
-            xc_g, yc_g, sx_g, sy_g, A_g, conf_g = fgf_full(
-                patch_gray.astype(np.float64))
+            score_fit = _evaluate_fit(
+                "score",
+                fgf_full(patch_score.astype(np.float64)),
+                expected_x,
+                expected_y,
+                pad,
+            )
         except Exception:
-            conf_g = 0
+            score_fit = None
 
-        if conf_s >= conf_g and conf_s > 0:
-            xc, yc, sx, sy, A, conf = xc_s, yc_s, sx_s, sy_s, A_s, conf_s
-        elif conf_g > 0:
-            xc, yc, sx, sy, A, conf = xc_g, yc_g, sx_g, sy_g, A_g, conf_g
-        else:
+        try:
+            gray_fit = _evaluate_fit(
+                "gray",
+                fgf_full(patch_gray.astype(np.float64)),
+                expected_x,
+                expected_y,
+                pad,
+            )
+        except Exception:
+            gray_fit = None
+
+        selected_fit = _select_best_fit(score_fit, gray_fit)
+        if selected_fit is None:
             continue
 
-        # Blend FGF confidence with the score-map response at the candidate
-        # This ensures candidates at high-scoring locations are ranked higher
-        final_conf = 0.6 * conf + 0.4 * response
+        fit_conf = selected_fit["fit_conf"]
+        response_conf = _compute_response_conf(score_map, cx, cy)
+        sanity_conf = selected_fit["sanity_conf"]
+        agreement_conf = min(1.0, candidate.detector_support / 3.0)
+        final_conf = (
+            0.45 * fit_conf +
+            0.25 * response_conf +
+            0.20 * sanity_conf +
+            0.10 * agreement_conf
+        )
 
         det = LaserDetection(
-            x=x0 + xc,
-            y=y0 + yc,
-            sigma_x=sx,
-            sigma_y=sy,
-            amplitude=A,
-            confidence=final_conf,
+            x=x0 + selected_fit["xc"],
+            y=y0 + selected_fit["yc"],
+            sigma_x=selected_fit["sigma_x"],
+            sigma_y=selected_fit["sigma_y"],
+            amplitude=selected_fit["amplitude"],
+            confidence=float(np.clip(final_conf, 0.0, 1.0)),
             patch_x0=x0,
             patch_y0=y0,
+            fit_source=selected_fit["source"],
+            candidate_response=response_conf,
+            detector_support=candidate.detector_support,
+            candidate_drift=selected_fit["drift"],
         )
         detections.append(det)
 
@@ -177,7 +356,7 @@ def detect_laser(image_path=None, image_bgr=None, laser_color="auto",
 
     # Post-FGF deduplication: remove detections within merge_dist of a
     # higher-confidence detection
-    merge_dist = max(10, pad // 2)
+    merge_dist = max(8, pad // 3)
     deduped = []
     for d in detections:
         is_dup = any(

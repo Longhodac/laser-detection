@@ -5,9 +5,64 @@ Combines LoG/DoG blob detection, morphological top-hat, and fast radial
 symmetry transform, with NMS fusion to produce ranked candidates.
 """
 
+from dataclasses import dataclass
 import numpy as np
 import cv2
-from skimage.feature import blob_log, blob_dog
+from skimage.feature import blob_log, blob_dog, peak_local_max
+
+
+@dataclass
+class Candidate:
+    """Single fused or raw candidate position."""
+    y: float
+    x: float
+    sigma: float
+    response: float
+    detector_sources: tuple = ()
+    detector_support: int = 1
+
+    def __iter__(self):
+        # Preserve backward-compatible unpacking as (y, x, sigma, response).
+        yield self.y
+        yield self.x
+        yield self.sigma
+        yield self.response
+
+
+def _build_candidate(y, x, sigma, score_map, source_name):
+    """Create a candidate with a comparable score-map response."""
+    yi, xi = int(round(y)), int(round(x))
+    if 0 <= yi < score_map.shape[0] and 0 <= xi < score_map.shape[1]:
+        response = float(score_map[yi, xi])
+        return Candidate(
+            y=float(y),
+            x=float(x),
+            sigma=float(sigma),
+            response=response,
+            detector_sources=(source_name,),
+            detector_support=1,
+        )
+    return None
+
+
+def _extract_local_peak_candidates(response_map, score_map, threshold_abs,
+                                   min_distance, sigma_est, source_name):
+    """Extract local maxima from a detector response map."""
+    if response_map.size == 0:
+        return []
+
+    coords = peak_local_max(
+        response_map,
+        min_distance=max(1, int(min_distance)),
+        threshold_abs=float(threshold_abs),
+        exclude_border=False,
+    )
+    candidates = []
+    for y, x in coords:
+        candidate = _build_candidate(y, x, sigma_est, score_map, source_name)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -26,10 +81,9 @@ def detect_blobs_log(score_map, min_sigma=1, max_sigma=8, num_sigma=6,
     results = []
     for blob in blobs:
         y, x, sigma = blob
-        yi, xi = int(round(y)), int(round(x))
-        if 0 <= yi < score_map.shape[0] and 0 <= xi < score_map.shape[1]:
-            response = score_map[yi, xi]
-            results.append((y, x, sigma, float(response)))
+        candidate = _build_candidate(y, x, sigma, score_map, "log")
+        if candidate is not None:
+            results.append(candidate)
     return results
 
 
@@ -43,10 +97,9 @@ def detect_blobs_dog(score_map, min_sigma=1, max_sigma=8, sigma_ratio=1.6,
     results = []
     for blob in blobs:
         y, x, sigma = blob
-        yi, xi = int(round(y)), int(round(x))
-        if 0 <= yi < score_map.shape[0] and 0 <= xi < score_map.shape[1]:
-            response = score_map[yi, xi]
-            results.append((y, x, sigma, float(response)))
+        candidate = _build_candidate(y, x, sigma, score_map, "dog")
+        if candidate is not None:
+            results.append(candidate)
     return results
 
 
@@ -72,22 +125,15 @@ def detect_tophat(score_map, kernel_radius=5, threshold_factor=3.0):
     std_val = tophat_f.std()
     thresh = mean_val + threshold_factor * std_val
 
-    candidates = []
-    binary = (tophat_f > thresh).astype(np.uint8)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours:
-        M = cv2.moments(cnt)
-        if M["m00"] < 1:
-            continue
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-        area = M["m00"]
-        sigma_est = np.sqrt(area / np.pi)
-        yi, xi = int(round(cy)), int(round(cx))
-        if 0 <= yi < score_map.shape[0] and 0 <= xi < score_map.shape[1]:
-            response = score_map[yi, xi]
-            candidates.append((cy, cx, sigma_est, float(response)))
+    sigma_est = max(1.0, kernel_radius / 2.0)
+    candidates = _extract_local_peak_candidates(
+        tophat_f,
+        score_map,
+        threshold_abs=thresh,
+        min_distance=max(1, kernel_radius // 2),
+        sigma_est=sigma_est,
+        source_name="tophat",
+    )
     return candidates, tophat_f
 
 
@@ -179,21 +225,15 @@ def detect_radial_symmetry(score_map, gray, radii=None, threshold_factor=3.0):
     std_val = combined.std()
     thresh = mean_val + threshold_factor * std_val
 
-    candidates = []
-    binary = (combined > thresh).astype(np.uint8)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours:
-        M = cv2.moments(cnt)
-        if M["m00"] < 1:
-            continue
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-        sigma_est = np.sqrt(M["m00"] / np.pi)
-        yi, xi = int(round(cy)), int(round(cx))
-        if 0 <= yi < score_map.shape[0] and 0 <= xi < score_map.shape[1]:
-            response = combined[yi, xi]
-            candidates.append((cy, cx, sigma_est, float(response)))
+    sigma_est = max(1.0, float(np.median(radii)))
+    candidates = _extract_local_peak_candidates(
+        combined,
+        score_map,
+        threshold_abs=thresh,
+        min_distance=max(1, int(np.median(radii))),
+        sigma_est=sigma_est,
+        source_name="radial",
+    )
     return candidates, combined
 
 
@@ -211,44 +251,68 @@ def nms_candidates(candidates, merge_radius=10, max_candidates=20):
     if not candidates:
         return []
 
-    cands = sorted(candidates, key=lambda c: c[3], reverse=True)
+    cands = sorted(
+        candidates,
+        key=lambda c: (c.response, c.detector_support),
+        reverse=True,
+    )
     kept = []
     used = np.zeros(len(cands), dtype=bool)
 
-    for i, (y1, x1, s1, r1) in enumerate(cands):
+    for i, cand1 in enumerate(cands):
         if used[i]:
             continue
         used[i] = True
-        group_y, group_x, group_s, group_r = [y1], [x1], [s1], [r1]
+        group_y = [cand1.y]
+        group_x = [cand1.x]
+        group_s = [cand1.sigma]
+        group_r = [cand1.response]
+        group_sources = set(cand1.detector_sources)
 
         for j in range(i + 1, len(cands)):
             if used[j]:
                 continue
-            y2, x2, s2, r2 = cands[j]
-            dist = np.sqrt((y1 - y2) ** 2 + (x1 - x2) ** 2)
+            cand2 = cands[j]
+            dist = np.sqrt((cand1.y - cand2.y) ** 2 + (cand1.x - cand2.x) ** 2)
             if dist < merge_radius:
                 used[j] = True
-                group_y.append(y2)
-                group_x.append(x2)
-                group_s.append(s2)
-                group_r.append(r2)
+                group_y.append(cand2.y)
+                group_x.append(cand2.x)
+                group_s.append(cand2.sigma)
+                group_r.append(cand2.response)
+                group_sources.update(cand2.detector_sources)
 
         weights = np.array(group_r)
         wsum = weights.sum()
-        avg_y = np.dot(weights, group_y) / wsum
-        avg_x = np.dot(weights, group_x) / wsum
-        avg_s = np.dot(weights, group_s) / wsum
+        if wsum <= 1e-8:
+            avg_y = float(np.mean(group_y))
+            avg_x = float(np.mean(group_x))
+            avg_s = float(np.mean(group_s))
+        else:
+            avg_y = float(np.dot(weights, group_y) / wsum)
+            avg_x = float(np.dot(weights, group_x) / wsum)
+            avg_s = float(np.dot(weights, group_s) / wsum)
         max_r = max(group_r)
-        kept.append((avg_y, avg_x, avg_s, max_r))
+        kept.append(
+            Candidate(
+                y=avg_y,
+                x=avg_x,
+                sigma=avg_s,
+                response=float(max_r),
+                detector_sources=tuple(sorted(group_sources)),
+                detector_support=len(group_sources),
+            )
+        )
 
-        if len(kept) >= max_candidates:
-            break
-
-    return kept
+    kept.sort(key=lambda c: (c.response, c.detector_support), reverse=True)
+    return kept[:max_candidates]
 
 
 def run_detectors(score_map, gray, use_log=True, use_tophat=True,
-                  use_radial=True, merge_radius=10, max_candidates=20):
+                  use_radial=True, merge_radius=10, max_candidates=20,
+                  log_threshold=0.15, dog_threshold=0.15,
+                  tophat_threshold_factor=4.0,
+                  radial_threshold_factor=4.0):
     """
     Run all enabled detectors and fuse results via NMS.
 
@@ -269,21 +333,28 @@ def run_detectors(score_map, gray, use_log=True, use_tophat=True,
     debug = {}
 
     if use_log:
-        log_cands = detect_blobs_log(score_map)
-        dog_cands = detect_blobs_dog(score_map)
+        log_cands = detect_blobs_log(score_map, threshold=log_threshold)
+        dog_cands = detect_blobs_dog(score_map, threshold=dog_threshold)
         all_candidates.extend(log_cands)
         all_candidates.extend(dog_cands)
         debug["log_count"] = len(log_cands)
         debug["dog_count"] = len(dog_cands)
 
     if use_tophat:
-        tophat_cands, tophat_map = detect_tophat(score_map)
+        tophat_cands, tophat_map = detect_tophat(
+            score_map,
+            threshold_factor=tophat_threshold_factor,
+        )
         all_candidates.extend(tophat_cands)
         debug["tophat_map"] = tophat_map
         debug["tophat_count"] = len(tophat_cands)
 
     if use_radial:
-        radial_cands, sym_map = detect_radial_symmetry(score_map, gray)
+        radial_cands, sym_map = detect_radial_symmetry(
+            score_map,
+            gray,
+            threshold_factor=radial_threshold_factor,
+        )
         all_candidates.extend(radial_cands)
         debug["sym_map"] = sym_map
         debug["radial_count"] = len(radial_cands)
@@ -292,5 +363,14 @@ def run_detectors(score_map, gray, use_log=True, use_tophat=True,
                            max_candidates=max_candidates)
     debug["raw_count"] = len(all_candidates)
     debug["fused_count"] = len(fused)
+    debug["thresholds"] = {
+        "log_threshold": float(log_threshold),
+        "dog_threshold": float(dog_threshold),
+        "tophat_threshold_factor": float(tophat_threshold_factor),
+        "radial_threshold_factor": float(radial_threshold_factor),
+        "merge_radius": float(merge_radius),
+        "max_candidates": int(max_candidates),
+    }
+    debug["fused_support"] = [cand.detector_support for cand in fused]
 
     return fused, debug

@@ -16,6 +16,47 @@ RED_HUE_RANGES = [(0, 10), (170, 180)]
 GREEN_HUE_RANGES = [(35, 85)]
 
 
+def _robust_normalize(score, lower_q=95.0, upper_q=99.9):
+    """
+    Normalize a score image using robust percentiles instead of a raw max.
+
+    This keeps a single saturated region from flattening the dynamic range of
+    the rest of the image.
+    """
+    score_f = score.astype(np.float32)
+    lo = float(np.percentile(score_f, lower_q))
+    hi = float(np.percentile(score_f, upper_q))
+
+    if not np.isfinite(lo):
+        lo = 0.0
+    if not np.isfinite(hi):
+        hi = float(score_f.max())
+
+    if hi <= lo + 1e-6:
+        lo = float(score_f.min())
+        hi = float(score_f.max())
+
+    if hi <= lo + 1e-6:
+        normalized = np.clip(score_f, 0.0, 1.0)
+    else:
+        normalized = np.clip((score_f - lo) / (hi - lo), 0.0, 1.0)
+
+    stats = {
+        "raw_min": float(score_f.min()),
+        "raw_max": float(score_f.max()),
+        "raw_mean": float(score_f.mean()),
+        "raw_std": float(score_f.std()),
+        "raw_q95": float(np.percentile(score_f, 95)),
+        "raw_q99": float(np.percentile(score_f, 99)),
+        "raw_q99_9": float(np.percentile(score_f, 99.9)),
+        "robust_lower_q": float(lower_q),
+        "robust_upper_q": float(upper_q),
+        "robust_lower_value": float(lo),
+        "robust_upper_value": float(hi),
+    }
+    return normalized.astype(np.float32), stats
+
+
 def _hsv_laser_score(hsv, hue_ranges, sat_min=80, val_min=80):
     """
     Score each pixel by how laser-like it is in HSV space.
@@ -94,11 +135,12 @@ def _local_contrast_score(gray_float, kernel_size=31):
     return np.clip(contrast / 5.0, 0, 1)
 
 
-def detect_laser_color(bgr):
+def detect_laser_color(bgr, quantile=99.9):
     """
     Auto-detect whether the dominant laser is red or green.
 
-    Computes max of red_score and green_score; whichever is higher wins.
+    Compares robust high-quantiles of red_score and green_score so a single
+    outlier pixel does not dominate the decision.
     """
     bgr_f = bgr.astype(np.float32) / 255.0
     b, g, r = bgr_f[:, :, 0], bgr_f[:, :, 1], bgr_f[:, :, 2]
@@ -106,13 +148,18 @@ def detect_laser_color(bgr):
     red_score = np.clip(r - 0.5 * g - 0.5 * b, 0, 1)
     green_score = np.clip(g - 0.5 * r - 0.5 * b, 0, 1)
 
-    if red_score.max() >= green_score.max():
+    red_q = float(np.percentile(red_score, quantile))
+    green_q = float(np.percentile(green_score, quantile))
+
+    if red_q >= green_q:
         return "red"
     return "green"
 
 
 def compute_laser_score(bgr, color="auto",
-                        w_hsv=0.35, w_lab=0.25, w_rgb=0.25, w_contrast=0.15):
+                        w_hsv=0.35, w_lab=0.25, w_rgb=0.25, w_contrast=0.15,
+                        robust_lower_q=95.0, robust_upper_q=99.9,
+                        return_debug=False):
     """
     Compute a unified laser likelihood map by fusing HSV, LAB, RGB, and
     local contrast scores.
@@ -129,7 +176,7 @@ def compute_laser_score(bgr, color="auto",
     detected_color : str   "red" or "green"
     """
     if color == "auto":
-        color = detect_laser_color(bgr)
+        color = detect_laser_color(bgr, quantile=robust_upper_q)
 
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
@@ -143,7 +190,26 @@ def compute_laser_score(bgr, color="auto",
     s_rgb = _rgb_laser_score(bgr_f, color)
     s_contrast = _local_contrast_score(gray_f)
 
-    fused = (w_hsv * s_hsv + w_lab * s_lab + w_rgb * s_rgb + w_contrast * s_contrast)
-    fused = fused / fused.max() if fused.max() > 0 else fused
+    fused_raw = (w_hsv * s_hsv + w_lab * s_lab + w_rgb * s_rgb +
+                 w_contrast * s_contrast)
+    fused, score_stats = _robust_normalize(
+        fused_raw,
+        lower_q=robust_lower_q,
+        upper_q=robust_upper_q,
+    )
+
+    if return_debug:
+        debug_info = {
+            "raw_score_map": fused_raw.astype(np.float32),
+            "score_stats": score_stats,
+            "score_weights": {
+                "hsv": float(w_hsv),
+                "lab": float(w_lab),
+                "rgb": float(w_rgb),
+                "contrast": float(w_contrast),
+            },
+            "color_quantile": float(robust_upper_q),
+        }
+        return fused.astype(np.float32), color, debug_info
 
     return fused.astype(np.float32), color
